@@ -1,0 +1,1753 @@
+# CODIGO-SISO-TCC
+
+
+// =================================================================================
+// SISO SYSTEM - SISTEMA INTEGRADO DE SEGURANÇA OPERACIONAL
+// Trabalho de Conclusão de Curso
+// =================================================================================
+//
+// Este sistema realiza o controle de acesso de operadores em ambiente industrial,
+// utilizando:
+//   - Leitor RFID (MFRC522) para identificação do operador
+//   - Sensor de temperatura (MLX90614) para verificar temperatura corporal
+//   - Sensor de batimentos (MAX30102) para verificar frequência cardíaca
+//   - Modulo rele de 4 canais para acionar sinaleiros (24V)
+//   - Botao de emergencia fisico (TIPO COGUMELO - NF)
+//   - Interface web para monitoramento e gestao
+//
+// O acesso e liberado APENAS quando AMBOS os sensores (temperatura e batimentos)
+// apresentarem leituras ESTAVEIS e dentro dos limites aceitaveis.
+//
+// BOTAO DE EMERGENCIA:
+//   - Tipo: Cogumelo NF (Normalmente Fechado)
+//   - Ligacao: COM -> GPIO 32 / NF -> GND
+//   - Logica: Botao solto = LOW (OK) / Botao pressionado = HIGH (EMERGENCIA)
+//
+// =================================================================================
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <Adafruit_MLX90614.h>
+#include "MAX30105.h"
+#include "heartRate.h" 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+
+// =================================================================================
+// 1. MAPEAMENTO DE HARDWARE
+// =================================================================================
+#define RFID_CS_PIN    5    // Chip Select (SDA) do MFRC522
+#define RFID_RST_PIN   4    // Reset do MFRC522
+
+#define RELE_VERMELHO   13  // Canal 1 - Sinaleiro vermelho
+#define RELE_AMARELO    14  // Canal 2 - Sinaleiro amarelo
+#define RELE_VERDE      12  // Canal 3 - Sinaleiro verde
+#define RELE_RESERVA    27  // Canal 4 - Reserva
+
+#define PINO_EMERGENCIA 32  // Botao cogumelo NF
+
+// =================================================================================
+// 2. PINOS I2C
+// =================================================================================
+#define I2C0_SDA        21  // Sensor MLX90614
+#define I2C0_SCL        22
+#define I2C1_SDA        33  // Sensor MAX30102
+#define I2C1_SCL        25
+
+// =================================================================================
+// 3. CONFIGURACOES DE REDE
+// =================================================================================
+const char* ssid = "Quarto-Heitor";
+const char* password = "260483hm";
+const char* SENHA_GERENCIA = "admin123";
+
+WebServer server(80);
+
+// =================================================================================
+// 4. INSTANCIACAO DOS PERIFERICOS
+// =================================================================================
+MFRC522 rfid(RFID_CS_PIN, RFID_RST_PIN);
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+MAX30105 particleSensor;
+
+// =================================================================================
+// 5. VARIAVEIS GLOBAIS
+// =================================================================================
+enum Estados { 
+  STANDBY_ENERGIZADO,
+  LEITURA_EM_ANDAMENTO,
+  LEITURA_APROVADA,
+  EMERGENCIA_COMPROMETIDA
+};
+Estados estadoAtual = STANDBY_ENERGIZADO;
+
+String idOperadorAtual = "";
+String nomeOperadorAtual = "";
+float temperaturaAtual = 0.0;
+int batimentosAtual = 0;
+unsigned long tempoTransicao = 0;
+const unsigned long TIMEOUT_LEITURA = 50000;
+const unsigned long TEMPO_BLOQUEIO = 300000;
+
+int totalAcessosLiberados = 0;
+int totalBloqueiosSaude = 0;
+int historicoBPM[10] = {0,0,0,0,0,0,0,0,0,0};
+int indiceGrafico = 0;
+long irValue = 0;
+
+// =================================================================================
+// 5.1 VARIAVEIS PARA CONTROLE DO RFID
+// =================================================================================
+unsigned long ultimaLeituraRFID = 0;
+const unsigned long INTERVALO_RFID = 200;
+String ultimoIDLido = "";
+unsigned long tempoUltimoID = 0;
+const unsigned long TEMPO_IGNORAR_MESMO_ID = 3000;
+
+// =================================================================================
+// 5.2 VARIAVEIS PARA BLOQUEIO DE CRACHA
+// =================================================================================
+struct CrachaBloqueado {
+  String id;
+  String nome;
+  unsigned long tempoBloqueio;
+  bool bloqueado;
+};
+
+CrachaBloqueado crachasBloqueados[10];
+int numCrachasBloqueados = 0;
+
+// =================================================================================
+// 5.3 VARIAVEIS PARA BARREIRA DE ACESSO
+// =================================================================================
+bool leituraTempValida = false;
+bool leituraBPMValida = false;
+bool acessoLiberado = false;
+int tentativasInstaveis = 0;
+const int MAX_TENTATIVAS_INSTAVEIS = 30;
+
+float bufferTemp[5] = {0,0,0,0,0};
+int idxTemp = 0;
+int contadorTemp = 0;
+int bufferBPM[5] = {0,0,0,0,0};
+int idxBPM = 0;
+int contadorBPM = 0;
+
+// =================================================================================
+// 5.4 MODO ESTAVEL
+// =================================================================================
+bool MODO_ESTAVEL = false;
+float tempForcada = 36.5;
+int bpmForcado = 75;
+
+float tempBase = 36.5;
+int bpmBase = 75;
+float tempVariacao = 0.8;
+int bpmVariacao = 15;
+unsigned long ultimaVariacaoEstavel = 0;
+const unsigned long INTERVALO_VARIACAO = 2000;
+
+// =================================================================================
+// 5.5 VARIAVEL PARA DELAY DO MODO ESTAVEL
+// =================================================================================
+unsigned long tempoInicioLeituraEstavel = 0;
+const unsigned long DELAY_MODO_ESTAVEL = 10000;
+bool aguardandoModoEstavel = false;
+
+// =================================================================================
+// 5.6 MODO TEMPERATURA INSTAVEL (VIA SERIAL MONITOR)
+// =================================================================================
+bool MODO_TEMP_INSTAVEL = false;
+float tempInstavel = 38.5;
+
+// =================================================================================
+// 6. BANCO DE DADOS DE OPERADORES
+// =================================================================================
+struct Operador {
+  String id;
+  String nome;
+  String status;
+  bool bloqueado;
+  unsigned long tempoDesbloqueio;
+};
+
+Operador operadores[] = {
+  {"D23D0801", "Heitor de Matos", "Ativo", false, 0},
+  {"838CF337", "Natan Santana", "Ativo", false, 0},
+  {"90X12Y34", "Luiz miguel", "Ativo", false, 0},
+};
+
+const int numOperadores = sizeof(operadores) / sizeof(operadores[0]);
+
+// =================================================================================
+// 7. FUNCOES DE BANCO DE DADOS E BLOQUEIO
+// =================================================================================
+bool buscarEValidarOperador(String id) {
+  id.toUpperCase();
+  
+  for (int i = 0; i < numCrachasBloqueados; i++) {
+    if (crachasBloqueados[i].id == id && crachasBloqueados[i].bloqueado) {
+      if (millis() - crachasBloqueados[i].tempoBloqueio > TEMPO_BLOQUEIO) {
+        crachasBloqueados[i].bloqueado = false;
+        Serial.println("Cracha desbloqueado automaticamente: " + id);
+      } else {
+        Serial.println("Cracha BLOQUEADO temporariamente: " + id);
+        return false;
+      }
+    }
+  }
+  
+  for (int i = 0; i < numOperadores; i++) {
+    if (operadores[i].id == id) {
+      if (operadores[i].status == "Ativo" && !operadores[i].bloqueado) {
+        nomeOperadorAtual = operadores[i].nome;
+        Serial.println("Operador ATIVO: " + nomeOperadorAtual);
+        return true;
+      } else if (operadores[i].bloqueado) {
+        Serial.println("Operador BLOQUEADO pela gerencia: " + operadores[i].nome);
+        return false;
+      } else {
+        Serial.println("Operador INATIVO: " + operadores[i].nome);
+        return false;
+      }
+    }
+  }
+  
+  Serial.println("ID NAO encontrado!");
+  return false;
+}
+
+void bloquearCracha(String id, String nome) {
+  for (int i = 0; i < numCrachasBloqueados; i++) {
+    if (crachasBloqueados[i].id == id) {
+      crachasBloqueados[i].bloqueado = true;
+      crachasBloqueados[i].tempoBloqueio = millis();
+      Serial.println("Cracha BLOQUEADO: " + id + " - " + nome);
+      return;
+    }
+  }
+  
+  if (numCrachasBloqueados < 10) {
+    crachasBloqueados[numCrachasBloqueados].id = id;
+    crachasBloqueados[numCrachasBloqueados].nome = nome;
+    crachasBloqueados[numCrachasBloqueados].bloqueado = true;
+    crachasBloqueados[numCrachasBloqueados].tempoBloqueio = millis();
+    numCrachasBloqueados++;
+    Serial.println("Cracha BLOQUEADO: " + id + " - " + nome);
+  }
+}
+
+void desbloquearCracha(String id) {
+  for (int i = 0; i < numCrachasBloqueados; i++) {
+    if (crachasBloqueados[i].id == id) {
+      crachasBloqueados[i].bloqueado = false;
+      Serial.println("Cracha DESBLOQUEADO: " + id);
+      return;
+    }
+  }
+}
+
+String listarCrachasBloqueados() {
+  String lista = "";
+  for (int i = 0; i < numCrachasBloqueados; i++) {
+    if (crachasBloqueados[i].bloqueado) {
+      lista += crachasBloqueados[i].id + " - " + crachasBloqueados[i].nome + "\n";
+    }
+  }
+  if (lista == "") lista = "Nenhum cracha bloqueado";
+  return lista;
+}
+
+// =================================================================================
+// 7.1 FUNCAO PARA INICIAR LEITURA COM ID SIMULADO
+// =================================================================================
+void iniciarLeituraSimulada(String id, String nome) {
+  Serial.println("\n========================================");
+  Serial.println("   RFID SIMULADO: " + id + " - " + nome);
+  Serial.println("========================================");
+  
+  idOperadorAtual = id;
+  nomeOperadorAtual = nome;
+  tempoTransicao = millis();
+  indiceGrafico = 0;
+  temperaturaAtual = 0;
+  batimentosAtual = 0;
+  leituraTempValida = false;
+  leituraBPMValida = false;
+  acessoLiberado = false;
+  tentativasInstaveis = 0;
+  contadorTemp = 0;
+  contadorBPM = 0;
+  estadoAtual = LEITURA_EM_ANDAMENTO;
+  
+  if (MODO_ESTAVEL) {
+    tempoInicioLeituraEstavel = millis();
+    aguardandoModoEstavel = true;
+    ultimaVariacaoEstavel = 0;
+    
+    Serial.println("MODO ESTAVEL ATIVO");
+    Serial.println("Aguardando 10 segundos de leitura...");
+    Serial.println("(Os valores vao variar naturalmente)");
+    Serial.println("========================================\n");
+  } else if (MODO_TEMP_INSTAVEL) {
+    Serial.println("MODO TEMP INSTAVEL ATIVO");
+    Serial.println("Simulando temperatura acima de 37.8C...");
+    Serial.println("O cracha sera BLOQUEADO rapidamente!");
+    Serial.println("========================================\n");
+  } else {
+    Serial.println("MODO NORMAL - Lendo sensores reais");
+    Serial.println("========================================\n");
+  }
+}
+
+// =================================================================================
+// 8. FUNCOES DOS SENSORES
+// =================================================================================
+void atualizarPainelHMI(bool vermelho, bool amarelo, bool verde) {
+  digitalWrite(RELE_VERMELHO, vermelho ? HIGH : LOW);
+  digitalWrite(RELE_AMARELO, amarelo ? HIGH : LOW);
+  digitalWrite(RELE_VERDE, verde ? HIGH : LOW);
+}
+
+String obterIDRFID() {
+  if (millis() - ultimaLeituraRFID < INTERVALO_RFID) return "";
+  ultimaLeituraRFID = millis();
+  
+  if (!rfid.PICC_IsNewCardPresent()) return "";
+  if (!rfid.PICC_ReadCardSerial()) return "";
+  
+  String id = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    id += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+    id += String(rfid.uid.uidByte[i], HEX);
+  }
+  id.toUpperCase();
+  
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  
+  if (id == ultimoIDLido && (millis() - tempoUltimoID) < TEMPO_IGNORAR_MESMO_ID) {
+    return "";
+  }
+  
+  ultimoIDLido = id;
+  tempoUltimoID = millis();
+  
+  Serial.print("RFID: ");
+  Serial.println(id);
+  
+  return id;
+}
+
+bool verificarEstabilidadeTemp(float novaTemp) {
+  bufferTemp[idxTemp] = novaTemp;
+  idxTemp = (idxTemp + 1) % 5;
+  if (contadorTemp < 5) contadorTemp++;
+  
+  if (contadorTemp < 3) return false;
+  
+  float soma = 0;
+  for (int i = 0; i < contadorTemp; i++) {
+    soma += bufferTemp[i];
+  }
+  float media = soma / contadorTemp;
+  
+  bool estavel = true;
+  for (int i = 0; i < contadorTemp; i++) {
+    if (abs(bufferTemp[i] - media) > 1.0) {
+      estavel = false;
+      break;
+    }
+  }
+  
+  if (estavel && media > 33 && media < 38) {
+    temperaturaAtual = media;
+    return true;
+  }
+  return false;
+}
+
+bool verificarEstabilidadeBPM(int novoBPM) {
+  bufferBPM[idxBPM] = novoBPM;
+  idxBPM = (idxBPM + 1) % 5;
+  if (contadorBPM < 5) contadorBPM++;
+  
+  if (contadorBPM < 3) return false;
+  
+  int soma = 0;
+  for (int i = 0; i < contadorBPM; i++) {
+    soma += bufferBPM[i];
+  }
+  int media = soma / contadorBPM;
+  
+  bool estavel = true;
+  for (int i = 0; i < contadorBPM; i++) {
+    if (abs(bufferBPM[i] - media) > 20) {
+      estavel = false;
+      break;
+    }
+  }
+  
+  if (estavel && media > 40 && media < 180) {
+    batimentosAtual = media;
+    return true;
+  }
+  return false;
+}
+
+void atualizarValoresEstaveis() {
+  if (millis() - ultimaVariacaoEstavel < INTERVALO_VARIACAO) return;
+  ultimaVariacaoEstavel = millis();
+  
+  float tempNova = tempBase + ((random(-800, 801)) / 1000.0);
+  if (tempNova < 35.5) tempNova = 35.5;
+  if (tempNova > 37.3) tempNova = 37.3;
+  tempForcada = tempNova;
+  
+  int bpmNovo = bpmBase + random(-bpmVariacao, bpmVariacao + 1);
+  if (bpmNovo < 60) bpmNovo = 60;
+  if (bpmNovo > 95) bpmNovo = 95;
+  bpmForcado = bpmNovo;
+  
+  temperaturaAtual = tempForcada;
+  batimentosAtual = bpmForcado;
+  
+  if (indiceGrafico < 10) {
+    historicoBPM[indiceGrafico] = bpmForcado;
+    indiceGrafico++;
+  } else {
+    for (int i = 0; i < 9; i++) {
+      historicoBPM[i] = historicoBPM[i + 1];
+    }
+    historicoBPM[9] = bpmForcado;
+  }
+}
+
+// =================================================================================
+// FUNCAO DE LEITURA DA TEMPERATURA (COM MODO INSTAVEL)
+// =================================================================================
+float lerTemperatura() {
+  // MODO TEMPERATURA INSTAVEL - Forca valores altos (acima do limite)
+  if (MODO_TEMP_INSTAVEL) {
+    float tempNova = 38.0 + ((random(0, 150)) / 100.0);  // 38.0 a 39.5C
+    tempInstavel = tempNova;
+    temperaturaAtual = tempInstavel;
+    
+    // Nao marca como valida (para forcar bloqueio)
+    leituraTempValida = false;
+    
+    static unsigned long ultimoPrint = 0;
+    if (millis() - ultimoPrint > 500) {
+      ultimoPrint = millis();
+      Serial.print("Temp INSTAVEL: ");
+      Serial.print(temperaturaAtual, 1);
+      Serial.println("C (acima do limite!)");
+    }
+    
+    return tempInstavel;
+  }
+  
+  if (MODO_ESTAVEL) {
+    atualizarValoresEstaveis();
+    leituraTempValida = true;
+    return temperaturaAtual;
+  }
+  
+  float temp = mlx.readObjectTempC();
+  
+  if (!isnan(temp) && temp > 30 && temp < 50) {
+    if (verificarEstabilidadeTemp(temp)) {
+      leituraTempValida = true;
+      static bool jaMostrou = false;
+      if (!jaMostrou) {
+        Serial.print("Temp ESTAVEL: ");
+        Serial.print(temperaturaAtual);
+        Serial.println("C");
+        jaMostrou = true;
+      }
+    }
+    return temp;
+  }
+  return 0;
+}
+
+int lerBatimentos() {
+  if (MODO_ESTAVEL) {
+    atualizarValoresEstaveis();
+    leituraBPMValida = true;
+    return batimentosAtual;
+  }
+  
+  irValue = particleSensor.getIR();
+  
+  if (irValue < 20000) return batimentosAtual;
+  
+  static long ultimoValor = 0;
+  static long picoMaximo = 0;
+  static long valeMinimo = 999999;
+  static bool subindo = false;
+  static unsigned long ultimoPico = 0;
+  static int picosDetectados = 0;
+  
+  if (irValue > ultimoValor && irValue > picoMaximo) {
+    picoMaximo = irValue;
+    subindo = true;
+  }
+  
+  if (irValue < ultimoValor && subindo && (picoMaximo - valeMinimo > 2000)) {
+    unsigned long agora = millis();
+    
+    if (ultimoPico > 0) {
+      unsigned long intervalo = agora - ultimoPico;
+      
+      if (intervalo > 300 && intervalo < 2000) {
+        int bpm = 60000 / intervalo;
+        
+        if (bpm > 30 && bpm < 200) {
+          picosDetectados++;
+          
+          if (batimentosAtual == 0 || batimentosAtual > 100) {
+            batimentosAtual = bpm;
+          } else {
+            batimentosAtual = (int)((batimentosAtual * 0.7) + (bpm * 0.3));
+          }
+          
+          if (indiceGrafico < 10) {
+            historicoBPM[indiceGrafico] = batimentosAtual;
+            indiceGrafico++;
+          } else {
+            for (int i = 0; i < 9; i++) {
+              historicoBPM[i] = historicoBPM[i + 1];
+            }
+            historicoBPM[9] = batimentosAtual;
+          }
+          
+          static int contador = 0;
+          contador++;
+          if (contador % 3 == 0) {
+            Serial.print("BPM: ");
+            Serial.print(batimentosAtual);
+            Serial.print(" | IR: ");
+            Serial.println(irValue);
+          }
+          
+          if (picosDetectados >= 3) {
+            if (verificarEstabilidadeBPM(batimentosAtual)) {
+              leituraBPMValida = true;
+            }
+          }
+        }
+      }
+    }
+    
+    ultimoPico = agora;
+    valeMinimo = irValue;
+    subindo = false;
+    picoMaximo = 0;
+  }
+  
+  if (irValue < ultimoValor && irValue < valeMinimo) {
+    valeMinimo = irValue;
+  }
+  
+  ultimoValor = irValue;
+  return batimentosAtual;
+}
+
+bool podeLiberarAcesso() {
+  if (!leituraTempValida) return false;
+  if (!leituraBPMValida) return false;
+  if (temperaturaAtual < 33.0 || temperaturaAtual > 42.0) return false;
+  if (temperaturaAtual >= 37.8) return false;
+  if (batimentosAtual < 40 || batimentosAtual > 180) return false;
+  return true;
+}
+
+// =================================================================================
+// 9. COMANDOS VIA SERIAL
+// =================================================================================
+void processarComandosSerial() {
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    switch(cmd) {
+      case 'r':
+      case '1':
+        iniciarLeituraSimulada("D23D0801", "Heitor de Matos");
+        break;
+        
+      case '2':
+        iniciarLeituraSimulada("838CF337", "Natan Santana");
+        break;
+        
+      case '3':
+        iniciarLeituraSimulada("90X12Y34", "Luiz Miguel");
+        break;
+        
+      // Comando para ativar/desativar modo estavel
+      case 't':
+        MODO_ESTAVEL = !MODO_ESTAVEL;
+        if (MODO_ESTAVEL) {
+          MODO_TEMP_INSTAVEL = false;
+          Serial.println("\n========================================");
+          Serial.println("   MODO ESTAVEL ATIVADO");
+          Serial.println("========================================");
+          Serial.println("   Temperatura: 35.7 a 37.3C (varia)");
+          Serial.println("   BPM: 60 a 95 (varia)");
+          Serial.println("   Delay de leitura: 10 segundos");
+          Serial.println("   Sempre dentro dos limites validos!");
+          Serial.println("========================================\n");
+        } else {
+          Serial.println("\nMODO ESTAVEL DESATIVADO");
+          Serial.println("Voltando a ler sensores reais\n");
+          aguardandoModoEstavel = false;
+        }
+        break;
+        
+      // Comando para ativar/desativar modo temperatura instavel
+      case 'i':
+        MODO_TEMP_INSTAVEL = !MODO_TEMP_INSTAVEL;
+        if (MODO_TEMP_INSTAVEL) {
+          MODO_ESTAVEL = false;
+          Serial.println("\n========================================");
+          Serial.println("   MODO TEMPERATURA INSTAVEL ATIVADO");
+          Serial.println("========================================");
+          Serial.println("   Temperatura: 38.0 a 39.5C");
+          Serial.println("   (ACIMA DO LIMITE DE 37.8C)");
+          Serial.println("   O cracha sera BLOQUEADO!");
+          Serial.println("========================================\n");
+        } else {
+          Serial.println("\nMODO TEMPERATURA INSTAVEL DESATIVADO");
+          Serial.println("Voltando ao comportamento normal\n");
+        }
+        break;
+        
+      case 'e':
+        estadoAtual = EMERGENCIA_COMPROMETIDA;
+        Serial.println("EMERGENCIA ACIONADA!");
+        break;
+        
+      case 's':
+        estadoAtual = STANDBY_ENERGIZADO;
+        idOperadorAtual = "";
+        nomeOperadorAtual = "";
+        temperaturaAtual = 0;
+        batimentosAtual = 0;
+        leituraTempValida = false;
+        leituraBPMValida = false;
+        acessoLiberado = false;
+        tentativasInstaveis = 0;
+        aguardandoModoEstavel = false;
+        MODO_TEMP_INSTAVEL = false;
+        Serial.println("STANDBY");
+        break;
+        
+      case 'd':
+        Serial.println("\n=== DADOS ATUAIS ===");
+        Serial.print("Estado: ");
+        Serial.println(estadoAtual);
+        Serial.print("Modo Estavel: ");
+        Serial.println(MODO_ESTAVEL ? "ATIVADO" : "DESATIVADO");
+        Serial.print("Modo Temp Instavel: ");
+        Serial.println(MODO_TEMP_INSTAVEL ? "ATIVADO" : "DESATIVADO");
+        Serial.print("Aguardando delay: ");
+        Serial.println(aguardandoModoEstavel ? "SIM" : "NAO");
+        Serial.print("Operador: ");
+        Serial.println(nomeOperadorAtual);
+        Serial.print("ID: ");
+        Serial.println(idOperadorAtual);
+        Serial.print("Temperatura: ");
+        Serial.print(temperaturaAtual);
+        Serial.println("C");
+        Serial.print("Batimentos: ");
+        Serial.println(batimentosAtual);
+        Serial.print("Temp Valida: ");
+        Serial.println(leituraTempValida ? "SIM" : "NAO");
+        Serial.print("BPM Valido: ");
+        Serial.println(leituraBPMValida ? "SIM" : "NAO");
+        Serial.print("Tentativas instaveis: ");
+        Serial.println(tentativasInstaveis);
+        Serial.print("Botao emergencia: ");
+        Serial.println(digitalRead(PINO_EMERGENCIA) == HIGH ? "PRESSIONADO" : "SOLTO (OK)");
+        Serial.println("\n=== CRACHAS BLOQUEADOS ===");
+        Serial.println(listarCrachasBloqueados());
+        break;
+        
+      case 'h':
+        Serial.println("\n========================================");
+        Serial.println("   COMANDOS DISPONIVEIS");
+        Serial.println("========================================");
+        Serial.println("SIMULACAO RFID:");
+        Serial.println("   1 - Simular RFID Heitor (D23D0801)");
+        Serial.println("   2 - Simular RFID Natan (838CF337)");
+        Serial.println("   3 - Simular RFID Luiz (90X12Y34)");
+        Serial.println("");
+        Serial.println("MODOS DE OPERACAO:");
+        Serial.println("   t - Ativar/Desativar MODO ESTAVEL");
+        Serial.println("   i - Ativar/Desativar TEMP INSTAVEL");
+        Serial.println("");
+        Serial.println("CONTROLE:");
+        Serial.println("   r - Iniciar Leitura (Heitor)");
+        Serial.println("   e - Emergencia");
+        Serial.println("   s - Standby");
+        Serial.println("   d - Mostrar Dados");
+        Serial.println("   h - Mostrar Ajuda");
+        Serial.println("========================================\n");
+        break;
+    }
+  }
+}
+
+// =================================================================================
+// 10. JSON E SERVIDOR WEB
+// =================================================================================
+String obterJsonStatus() {
+  StaticJsonDocument<1024> doc;
+  doc["estado"] = estadoAtual;
+  doc["operador"] = nomeOperadorAtual;
+  doc["id"] = idOperadorAtual;
+  doc["temp"] = temperaturaAtual;
+  doc["bpm"] = batimentosAtual;
+  doc["liberados"] = totalAcessosLiberados;
+  doc["bloqueados"] = totalBloqueiosSaude;
+  doc["irValue"] = irValue;
+  doc["tempValida"] = leituraTempValida;
+  doc["bpmValido"] = leituraBPMValida;
+  doc["tentativasInstaveis"] = tentativasInstaveis;
+  
+  JsonArray arrayBpm = doc.createNestedArray("historicoBpm");
+  for (int i = 0; i < 10; i++) arrayBpm.add(historicoBPM[i]);
+
+  String resposta;
+  serializeJson(doc, resposta);
+  return resposta;
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SISO SYSTEM - TCC</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:'Inter',sans-serif;background:#0a0e14;color:#e5e7eb;min-height:100vh}
+        .container{max-width:1400px;margin:0 auto;padding:20px}
+        .header{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:2px solid #1590ff;flex-wrap:wrap;gap:15px}
+        .title{color:#1590ff;font-size:32px;font-weight:800}
+        .title span{color:#fff}
+        .status{font-size:16px;padding:8px 20px;border-radius:20px;background:#1a2a1a;color:#32e04d}
+        .status-offline{background:#2a1a1a;color:#ff4033}
+        .tabs{display:flex;gap:10px;margin:20px 0;flex-wrap:wrap}
+        .tab{padding:12px 30px;border-radius:10px;border:2px solid #1f2c38;background:transparent;color:#8a9aa8;cursor:pointer;font-weight:600;transition:0.3s;font-size:14px}
+        .tab:hover{background:#1a2530;color:#fff}
+        .tab.active{background:#1590ff;border-color:#1590ff;color:#fff}
+        .tab-content{display:none;animation:fadeIn 0.5s}
+        .tab-content.active{display:block}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-top:20px}
+        .card{background:#111920;border:1px solid #1f2c38;border-radius:12px;padding:20px;transition:0.3s}
+        .card:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,0.3)}
+        .card h3{color:#1590ff;margin-bottom:15px;padding-bottom:10px;border-bottom:1px solid #1f2c38;font-size:16px}
+        .operator-name{font-size:24px;color:#1590ff;margin:10px 0}
+        .operator-id{color:#6a7a8a;font-size:14px}
+        .operator-status{display:inline-block;padding:4px 16px;border-radius:20px;font-size:12px;font-weight:bold;margin-top:8px}
+        .status-ativo{background:#1a3a2a;color:#32e04d}
+        .status-aguardando{background:#2a2a1a;color:#ffcc00}
+        .status-bloqueado{background:#3a1a1a;color:#ff4033}
+        .health-value{font-size:28px;font-weight:bold}
+        .temp-value{color:#ff6b6b}
+        .bpm-value{color:#4ecdc4}
+        .led-indicator{display:flex;gap:15px;margin-top:15px;flex-wrap:wrap}
+        .led{width:45px;height:45px;border-radius:50%;border:2px solid #333;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:bold;transition:0.3s}
+        .led-on-red{background:#ff0000;border-color:#ff0000;box-shadow:0 0 30px #ff000066}
+        .led-on-yellow{background:#ffcc00;border-color:#ffcc00;box-shadow:0 0 30px #ffcc0066}
+        .led-on-green{background:#00ff00;border-color:#00ff00;box-shadow:0 0 30px #00ff0066}
+        .led-off{background:#1a1a1a}
+        .btn{padding:12px 20px;border:1px solid #2a3a48;border-radius:8px;background:#0d151c;color:#fff;cursor:pointer;font-weight:600;transition:0.3s;font-size:13px}
+        .btn:hover{background:#1a2530;transform:translateY(-2px)}
+        .btn-danger{border-color:#ff4033;color:#ff4033}
+        .btn-danger:hover{background:#2a1010}
+        .btn-success{border-color:#32e04d;color:#32e04d}
+        .btn-success:hover{background:#102a1a}
+        .btn-warning{border-color:#ffcc00;color:#ffcc00}
+        .btn-warning:hover{background:#2a2a10}
+        .btn-primary{border-color:#1590ff;color:#1590ff}
+        .btn-primary:hover{background:#0a1a2a}
+        .btn-rfid{border-color:#9b59ff;color:#9b59ff;background:#1a0a2a}
+        .btn-rfid:hover{background:#2a1a3a}
+        .actions-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:10px}
+        .stat-item{display:flex;justify-content:space-between;padding:10px;background:#0d151c;border-radius:6px;margin-bottom:8px}
+        .stat-label{color:#8a9aa8}
+        .stat-number{font-weight:bold;font-size:18px}
+        .stat-green .stat-number{color:#32e04d}
+        .stat-red .stat-number{color:#ff4033}
+        .chart-container{height:200px;margin-top:10px}
+        .chart-bar{display:flex;align-items:flex-end;height:150px;gap:6px;padding-top:10px}
+        .bar{flex:1;background:linear-gradient(180deg,#4ecdc4,#2a6a6a);border-radius:4px 4px 0 0;min-height:5px;transition:0.5s;position:relative}
+        .bar-value{position:absolute;top:-20px;left:50%;transform:translateX(-50%);font-size:10px;color:#4ecdc4}
+        .event{display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:6px;background:#0d151c;border-radius:6px;font-size:13px}
+        .event-time{color:#6a7a8a;min-width:70px;font-size:11px}
+        .login-box{background:#111920;border:1px solid #1f2c38;border-radius:12px;padding:30px;max-width:400px;margin:40px auto}
+        .login-box input{width:100%;padding:12px;margin:10px 0;background:#0d151c;border:1px solid #1f2c38;border-radius:8px;color:#fff;font-size:16px}
+        .login-box input:focus{outline:none;border-color:#1590ff}
+        .cracha-item{display:flex;justify-content:space-between;align-items:center;padding:10px;background:#0d151c;border-radius:6px;margin-bottom:6px}
+        .cracha-item .id{color:#1590ff;font-weight:bold}
+        .cracha-item .nome{color:#e5e7eb}
+        .footer{margin-top:40px;padding:20px;text-align:center;border-top:1px solid #1a2530;color:#6a7a8a;font-size:13px}
+        .footer span{color:#1590ff}
+        .emergency-overlay{display:none;position:fixed;inset:0;background:rgba(80,0,0,0.95);z-index:9999;align-items:center;justify-content:center}
+        .emergency-overlay.show{display:flex}
+        .emergency-box{border:3px solid #ff0000;padding:50px;border-radius:20px;background:#1a0505;text-align:center}
+        .emergency-box h1{color:#ff0000;font-size:60px}
+        .emergency-box p{color:#fff;font-size:24px;margin:20px 0}
+        .emergency-box button{padding:15px 50px;background:#2a0a0a;border:2px solid #ff0000;color:#fff;border-radius:8px;cursor:pointer;font-size:20px;font-weight:bold}
+        .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:bold}
+        .badge-red{background:#3a1a1a;color:#ff4033}
+        .badge-green{background:#1a3a2a;color:#32e04d}
+        .badge-yellow{background:#2a2a1a;color:#ffcc00}
+        .warning-text{color:#ffcc00;font-size:12px}
+        @media(max-width:768px){.grid{grid-template-columns:1fr}.tabs .tab{flex:1;text-align:center;padding:10px 15px;font-size:12px}}
+    </style>
+</head>
+<body>
+
+<div class="emergency-overlay" id="emergencyOverlay">
+    <div class="emergency-box">
+        <h1>EMERGENCIA</h1>
+        <p>SISTEMA BLOQUEADO</p>
+        <button onclick="resetEmergency()">RESETAR</button>
+    </div>
+</div>
+
+<div class="container">
+    <div class="header">
+        <div class="title">SISO <span>SYSTEM</span></div>
+        <div class="status" id="connStatus">ONLINE</div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+        <button class="tab" onclick="showTab('funcionarios')">Funcionarios</button>
+        <button class="tab" onclick="showTab('gerencia')">Gerencia</button>
+    </div>
+
+    <!-- ABA DASHBOARD -->
+    <div class="tab-content active" id="tab-dashboard">
+        <div class="grid">
+            <div class="card">
+                <h3>OPERADOR</h3>
+                <div class="operator-name" id="opName">Aguardando...</div>
+                <div class="operator-id" id="opID">ID: ---</div>
+                <div class="operator-status status-aguardando" id="opStatus">AGUARDANDO</div>
+                <div class="warning-text" id="tentativasInfo"></div>
+            </div>
+            <div class="card">
+                <h3>STATUS</h3>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <div style="font-size:28px" id="sysStatus">STANDBY</div>
+                    <div style="font-size:50px" id="sysIcon">&#9679;</div>
+                </div>
+                <div class="led-indicator">
+                    <div class="led led-off" id="ledRed">R</div>
+                    <div class="led led-off" id="ledYellow">Y</div>
+                    <div class="led led-off" id="ledGreen">G</div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>SAUDE</h3>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                    <div style="background:#0d151c;border-radius:8px;padding:15px;text-align:center">
+                        <div style="color:#8a9aa8;font-size:12px">TEMPERATURA</div>
+                        <div class="health-value temp-value"><span id="tempVal">0.0</span>C</div>
+                        <div style="font-size:12px;color:#6a7a8a" id="tempStatus">AGUARDANDO</div>
+                    </div>
+                    <div style="background:#0d151c;border-radius:8px;padding:15px;text-align:center">
+                        <div style="color:#8a9aa8;font-size:12px">BATIMENTOS</div>
+                        <div class="health-value bpm-value"><span id="bpmVal">0</span> BPM</div>
+                        <div style="font-size:12px;color:#6a7a8a" id="bpmStatus">AGUARDANDO</div>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <div class="chart-bar" id="chartBars"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h3>ESTATISTICAS</h3>
+                <div class="stat-item stat-green"><span class="stat-label">Acessos Liberados</span><span class="stat-number" id="libCount">0</span></div>
+                <div class="stat-item stat-red"><span class="stat-label">Bloqueios por Saude</span><span class="stat-number" id="blkCount">0</span></div>
+                <div class="stat-item"><span class="stat-label">Crachas Bloqueados</span><span class="stat-number" style="color:#ffcc00" id="blockedBadgeCount">0</span></div>
+            </div>
+            <div class="card">
+                <h3>SIMULACAO RFID</h3>
+                <div style="display:grid;gap:8px">
+                    <button class="btn btn-rfid" onclick="simularRFID('D23D0801')">Heitor de Matos (D23D0801)</button>
+                    <button class="btn btn-rfid" onclick="simularRFID('838CF337')">Natan Santana (838CF337)</button>
+                    <button class="btn btn-rfid" onclick="simularRFID('90X12Y34')">Luiz Miguel (90X12Y34)</button>
+                </div>
+            </div>
+            <div class="card">
+                <h3>ACOES RAPIDAS</h3>
+                <div class="actions-grid">
+                    <button class="btn btn-success" onclick="location.reload()">ATUALIZAR</button>
+                    <button class="btn btn-warning" onclick="resetSystem()">RESET</button>
+                    <button class="btn btn-danger" onclick="triggerEmergency()">EMERGENCIA</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card" style="grid-column:span 3">
+                <h3>EVENTOS</h3>
+                <div id="eventLog">
+                    <div class="event"><span class="event-time">AGORA</span><span style="color:#32e04d">&#9679;</span><span id="eventStatus">Sistema pronto</span></div>
+                    <div class="event"><span class="event-time">RFID</span><span style="color:#6a7a8a">&#9635;</span><span id="eventRFID">Aguardando cracha</span></div>
+                    <div class="event"><span class="event-time">TEMP</span><span style="color:#6a7a8a">&#9675;</span><span id="eventTemp">Aguardando</span></div>
+                    <div class="event"><span class="event-time">BPM</span><span style="color:#6a7a8a">&#9675;</span><span id="eventBPM">Aguardando</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ABA FUNCIONARIOS -->
+    <div class="tab-content" id="tab-funcionarios">
+        <div class="card">
+            <h3>FUNCIONARIOS CADASTRADOS</h3>
+            <div style="overflow-x:auto">
+                <table style="width:100%;border-collapse:collapse;font-size:14px">
+                    <thead>
+                        <tr style="border-bottom:1px solid #1f2c38">
+                            <th style="text-align:left;padding:12px 10px;color:#8a9aa8">ID</th>
+                            <th style="text-align:left;padding:12px 10px;color:#8a9aa8">Nome</th>
+                            <th style="text-align:left;padding:12px 10px;color:#8a9aa8">Status</th>
+                            <th style="text-align:left;padding:12px 10px;color:#8a9aa8">Situacao</th>
+                        </tr>
+                    </thead>
+                    <tbody id="funcionariosList"></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card" style="margin-top:20px">
+            <h3>CRACHAS BLOQUEADOS</h3>
+            <div id="crachasBloqueadosList" style="font-size:14px;color:#6a7a8a">Nenhum cracha bloqueado</div>
+        </div>
+    </div>
+
+    <!-- ABA GERENCIA -->
+    <div class="tab-content" id="tab-gerencia">
+        <div id="gerenciaLogin">
+            <div class="login-box">
+                <h3 style="color:#1590ff;margin-bottom:20px">AREA RESTRITA</h3>
+                <p style="color:#8a9aa8;margin-bottom:15px">Digite a senha de gerencia para acessar</p>
+                <input type="password" id="senhaGerencia" placeholder="Digite a senha..." onkeydown="if(event.key==='Enter')loginGerencia()">
+                <button class="btn btn-primary" style="width:100%;margin-top:10px" onclick="loginGerencia()">Acessar</button>
+                <div id="erroSenha" style="color:#ff4033;margin-top:10px;display:none">Senha incorreta!</div>
+            </div>
+        </div>
+        <div id="gerenciaContent" style="display:none">
+            <div class="grid">
+                <div class="card">
+                    <h3>GERENCIAR BLOQUEIOS</h3>
+                    <p style="color:#8a9aa8;margin-bottom:15px;font-size:14px">Desbloqueie crachas que foram bloqueados</p>
+                    <div id="crachasParaDesbloquear"><p style="color:#6a7a8a">Nenhum cracha bloqueado</p></div>
+                </div>
+                <div class="card">
+                    <h3>RELATORIO GERENCIAL</h3>
+                    <div class="stat-item stat-green"><span class="stat-label">Total de Acessos</span><span class="stat-number" id="gerenciaLibCount">0</span></div>
+                    <div class="stat-item stat-red"><span class="stat-label">Total de Bloqueios</span><span class="stat-number" id="gerenciaBlkCount">0</span></div>
+                    <div class="stat-item"><span class="stat-label">Crachas Bloqueados</span><span class="stat-number" style="color:#ffcc00" id="gerenciaBlockedCount">0</span></div>
+                    <button class="btn btn-warning" style="width:100%;margin-top:15px" onclick="logoutGerencia()">Sair</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">SISTEMA INTEGRADO DE SEGURANCA OPERACIONAL - TCC 2026</div>
+</div>
+
+<script>
+const STATE_STANDBY=0, STATE_READING=1, STATE_APPROVED=2, STATE_EMERGENCY=3;
+const SENHA_GERENCIA = "admin123";
+let logadoGerencia = false;
+
+function showTab(tab) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+    document.getElementById('tab-' + tab).classList.add('active');
+    document.querySelector(`.tab[onclick="showTab('${tab}')"]`).classList.add('active');
+}
+
+function simularRFID(id) {
+    fetch('/simular_rfid?id=' + id)
+        .then(r => r.text())
+        .then(resposta => { console.log('Simulacao RFID:', resposta); updateData(); })
+        .catch(err => console.log('Erro:', err));
+}
+
+function loginGerencia() {
+    const senha = document.getElementById('senhaGerencia').value;
+    if (senha === SENHA_GERENCIA) {
+        document.getElementById('gerenciaLogin').style.display = 'none';
+        document.getElementById('gerenciaContent').style.display = 'block';
+        document.getElementById('erroSenha').style.display = 'none';
+        logadoGerencia = true;
+        updateGerenciaData();
+    } else {
+        document.getElementById('erroSenha').style.display = 'block';
+        setTimeout(() => document.getElementById('erroSenha').style.display = 'none', 3000);
+    }
+}
+
+function logoutGerencia() {
+    document.getElementById('gerenciaLogin').style.display = 'block';
+    document.getElementById('gerenciaContent').style.display = 'none';
+    document.getElementById('senhaGerencia').value = '';
+    logadoGerencia = false;
+}
+
+function desbloquearCracha(id) {
+    fetch('/desbloquear?id=' + id)
+        .then(() => { updateGerenciaData(); updateData(); })
+        .catch(err => console.log('Erro:', err));
+}
+
+function triggerEmergency() {
+    if (confirm('Acionar EMERGENCIA?')) {
+        fetch('/emergencia?action=trigger')
+            .then(() => document.getElementById('emergencyOverlay').classList.add('show'));
+    }
+}
+
+function resetEmergency() {
+    fetch('/emergencia?action=reset')
+        .then(() => document.getElementById('emergencyOverlay').classList.remove('show'));
+}
+
+function resetSystem() {
+    if (confirm('Resetar sistema?')) {
+        fetch('/emergencia?action=reset').then(() => location.reload());
+    }
+}
+
+function updateLEDs(state) {
+    const r = document.getElementById('ledRed');
+    const y = document.getElementById('ledYellow');
+    const g = document.getElementById('ledGreen');
+    r.className = 'led led-off'; y.className = 'led led-off'; g.className = 'led led-off';
+    if (state === STATE_STANDBY || state === STATE_EMERGENCY) r.className = 'led led-on-red';
+    else if (state === STATE_READING) y.className = 'led led-on-yellow';
+    else if (state === STATE_APPROVED) g.className = 'led led-on-green';
+}
+
+function setStatus(state) {
+    const el = document.getElementById('sysStatus');
+    const icon = document.getElementById('sysIcon');
+    if (state === STATE_STANDBY) { el.textContent = 'STANDBY'; el.style.color = '#ffcc00'; icon.textContent = '\u25CF'; icon.style.color = '#ffcc00'; }
+    else if (state === STATE_READING) { el.textContent = 'VALIDANDO'; el.style.color = '#1590ff'; icon.textContent = '\u25C9'; icon.style.color = '#1590ff'; }
+    else if (state === STATE_APPROVED) { el.textContent = 'LIBERADO'; el.style.color = '#32e04d'; icon.textContent = '\u2713'; icon.style.color = '#32e04d'; }
+    else if (state === STATE_EMERGENCY) { el.textContent = 'EMERGENCIA'; el.style.color = '#ff0000'; icon.textContent = '!'; icon.style.color = '#ff0000'; }
+    updateLEDs(state);
+}
+
+function updateChart(values) {
+    const container = document.getElementById('chartBars');
+    const maxVal = Math.max(150, ...values);
+    let html = '';
+    values.forEach(v => {
+        const pct = maxVal > 0 ? (v / maxVal) * 100 : 0;
+        const h = Math.max(5, pct * 1.2);
+        html += `<div class="bar" style="height:${h}%;background:${v > 100 ? '#ff6b6b' : '#4ecdc4'}">
+            <span class="bar-value">${v || 0}</span>
+        </div>`;
+    });
+    container.innerHTML = html;
+}
+
+function updateFuncionariosList(operadores) {
+    const tbody = document.getElementById('funcionariosList');
+    let html = '';
+    operadores.forEach(op => {
+        const statusClass = op.status === 'Ativo' ? 'status-ativo' : 'status-bloqueado';
+        const badgeClass = op.bloqueado ? 'badge-red' : 'badge-green';
+        const badgeText = op.bloqueado ? 'BLOQUEADO' : 'ATIVO';
+        html += `<tr style="border-bottom:1px solid #1a2530">
+            <td style="padding:12px 10px;color:#1590ff;font-weight:bold">${op.id}</td>
+            <td style="padding:12px 10px">${op.nome}</td>
+            <td style="padding:12px 10px"><span class="operator-status ${statusClass}">${op.status}</span></td>
+            <td style="padding:12px 10px"><span class="badge ${badgeClass}">${badgeText}</span></td>
+        </tr>`;
+    });
+    tbody.innerHTML = html;
+}
+
+function updateCrachasBloqueados(lista) {
+    const container = document.getElementById('crachasBloqueadosList');
+    if (!lista || lista === 'Nenhum cracha bloqueado') {
+        container.innerHTML = 'Nenhum cracha bloqueado';
+        return;
+    }
+    let html = '';
+    const items = lista.split('\n');
+    items.forEach(item => {
+        if (item.trim()) {
+            const parts = item.split(' - ');
+            if (parts.length === 2) {
+                html += `<div class="cracha-item"><span><span class="id">${parts[0]}</span> - <span class="nome">${parts[1]}</span></span></div>`;
+            }
+        }
+    });
+    container.innerHTML = html || 'Nenhum cracha bloqueado';
+}
+
+function updateGerenciaData() {
+    if (!logadoGerencia) return;
+    fetch('/status')
+        .then(r => r.json())
+        .then(d => {
+            document.getElementById('gerenciaLibCount').textContent = d.liberados || 0;
+            document.getElementById('gerenciaBlkCount').textContent = d.bloqueados || 0;
+            const container = document.getElementById('crachasParaDesbloquear');
+            const lista = d.crachasBloqueados || 'Nenhum cracha bloqueado';
+            if (lista === 'Nenhum cracha bloqueado') {
+                container.innerHTML = '<p style="color:#32e04d">Nenhum cracha bloqueado</p>';
+            } else {
+                let html = '';
+                const items = lista.split('\n');
+                items.forEach(item => {
+                    if (item.trim()) {
+                        const parts = item.split(' - ');
+                        if (parts.length === 2) {
+                            html += `<div class="cracha-item">
+                                <span><span class="id">${parts[0]}</span> - <span class="nome">${parts[1]}</span></span>
+                                <button class="btn btn-success" style="padding:5px 15px;font-size:12px" onclick="desbloquearCracha('${parts[0]}')">Desbloquear</button>
+                            </div>`;
+                        }
+                    }
+                });
+                container.innerHTML = html;
+            }
+            document.getElementById('gerenciaBlockedCount').textContent = lista === 'Nenhum cracha bloqueado' ? 0 : items.length;
+        });
+}
+
+function updateData() {
+    fetch('/status')
+        .then(r => r.json())
+        .then(d => {
+            setStatus(Number(d.estado));
+            
+            if (d.id && d.id !== '') {
+                document.getElementById('opName').textContent = d.operador || 'Operador';
+                document.getElementById('opID').textContent = 'ID: ' + d.id;
+                document.getElementById('opStatus').textContent = 'ATIVO';
+                document.getElementById('opStatus').className = 'operator-status status-ativo';
+                document.getElementById('eventRFID').innerHTML = 'RFID: ' + d.id;
+            } else {
+                document.getElementById('opName').textContent = 'Aguardando...';
+                document.getElementById('opID').textContent = 'ID: ---';
+                document.getElementById('opStatus').textContent = 'AGUARDANDO';
+                document.getElementById('opStatus').className = 'operator-status status-aguardando';
+                document.getElementById('eventRFID').innerHTML = 'Aguardando cracha';
+            }
+            
+            const tentativas = d.tentativasInstaveis || 0;
+            if (tentativas > 0 && d.id && d.id !== '') {
+                document.getElementById('tentativasInfo').textContent = 'Medicoes INSTAVEIS: ' + tentativas + '/30';
+                document.getElementById('tentativasInfo').style.color = '#ffcc00';
+            } else {
+                document.getElementById('tentativasInfo').textContent = '';
+            }
+            
+            const t = Number(d.temp || 0);
+            document.getElementById('tempVal').textContent = t.toFixed(1);
+            if (d.tempValida) {
+                if (t >= 37.8) {
+                    document.getElementById('tempStatus').textContent = 'ALTA';
+                    document.getElementById('tempStatus').style.color = '#ff4033';
+                    document.getElementById('eventTemp').innerHTML = 'Temp ALTA';
+                } else if (t > 33) {
+                    document.getElementById('tempStatus').textContent = 'ESTAVEL';
+                    document.getElementById('tempStatus').style.color = '#32e04d';
+                    document.getElementById('eventTemp').innerHTML = t.toFixed(1) + 'C';
+                }
+            } else {
+                if (t >= 37.8) {
+                    document.getElementById('tempStatus').textContent = 'INSTAVEL';
+                    document.getElementById('tempStatus').style.color = '#ff4033';
+                    document.getElementById('eventTemp').innerHTML = 'Temp ALTA - instavel';
+                } else {
+                    document.getElementById('tempStatus').textContent = 'VALIDANDO';
+                    document.getElementById('tempStatus').style.color = '#1590ff';
+                    document.getElementById('eventTemp').innerHTML = 'Aguardando';
+                }
+            }
+            
+            const bpm = Number(d.bpm || 0);
+            document.getElementById('bpmVal').textContent = bpm;
+            if (d.bpmValido && bpm > 0) {
+                document.getElementById('bpmStatus').textContent = 'ESTAVEL';
+                document.getElementById('bpmStatus').style.color = '#32e04d';
+                document.getElementById('eventBPM').innerHTML = bpm + ' BPM';
+            } else if (bpm > 0) {
+                document.getElementById('bpmStatus').textContent = 'VALIDANDO';
+                document.getElementById('bpmStatus').style.color = '#1590ff';
+                document.getElementById('eventBPM').innerHTML = bpm + ' BPM';
+            } else {
+                document.getElementById('bpmStatus').textContent = 'AGUARDANDO';
+                document.getElementById('bpmStatus').style.color = '#6a7a8a';
+                document.getElementById('eventBPM').innerHTML = 'Aguardando';
+            }
+            
+            document.getElementById('libCount').textContent = d.liberados || 0;
+            document.getElementById('blkCount').textContent = d.bloqueados || 0;
+            
+            const lista = d.crachasBloqueados || 'Nenhum cracha bloqueado';
+            const count = lista === 'Nenhum cracha bloqueado' ? 0 : lista.split('\n').filter(l => l.trim()).length;
+            document.getElementById('blockedBadgeCount').textContent = count;
+            updateCrachasBloqueados(lista);
+            
+            if (d.historicoBpm) updateChart(d.historicoBpm);
+            
+            const statusEl = document.getElementById('eventStatus');
+            if (Number(d.estado) === STATE_EMERGENCY) {
+                statusEl.innerHTML = 'EMERGENCIA!';
+                statusEl.style.color = '#ff4033';
+                document.getElementById('emergencyOverlay').classList.add('show');
+            } else if (Number(d.estado) === STATE_READING) {
+                statusEl.innerHTML = 'Validando sinais...';
+                statusEl.style.color = '#1590ff';
+                document.getElementById('emergencyOverlay').classList.remove('show');
+            } else if (Number(d.estado) === STATE_APPROVED) {
+                statusEl.innerHTML = 'ACESSO LIBERADO!';
+                statusEl.style.color = '#32e04d';
+                document.getElementById('emergencyOverlay').classList.remove('show');
+            } else {
+                statusEl.innerHTML = 'Sistema em standby';
+                statusEl.style.color = '#32e04d';
+                document.getElementById('emergencyOverlay').classList.remove('show');
+            }
+            
+            if (d.operadores) updateFuncionariosList(d.operadores);
+            if (logadoGerencia) updateGerenciaData();
+        })
+        .catch(err => {
+            console.log('Erro:', err);
+            document.getElementById('connStatus').textContent = 'OFFLINE';
+            document.getElementById('connStatus').className = 'status status-offline';
+        });
+}
+
+function carregarOperadores() {
+    fetch('/operadores')
+        .then(r => r.json())
+        .then(data => { if (data.operadores) updateFuncionariosList(data.operadores); })
+        .catch(err => console.log('Erro:', err));
+}
+
+setInterval(updateData, 1000);
+window.onload = function() { updateData(); carregarOperadores(); };
+</script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleStatus() {
+  String json = obterJsonStatus();
+  
+  StaticJsonDocument<2048> doc;
+  deserializeJson(doc, json);
+  
+  JsonArray operadoresArray = doc.createNestedArray("operadores");
+  for (int i = 0; i < numOperadores; i++) {
+    JsonObject op = operadoresArray.createNestedObject();
+    op["id"] = operadores[i].id;
+    op["nome"] = operadores[i].nome;
+    op["status"] = operadores[i].status;
+    op["bloqueado"] = operadores[i].bloqueado;
+  }
+  
+  doc["crachasBloqueados"] = listarCrachasBloqueados();
+  
+  String resposta;
+  serializeJson(doc, resposta);
+  server.send(200, "application/json", resposta);
+}
+
+void handleOperadores() {
+  StaticJsonDocument<1024> doc;
+  JsonArray operadoresArray = doc.createNestedArray("operadores");
+  for (int i = 0; i < numOperadores; i++) {
+    JsonObject op = operadoresArray.createNestedObject();
+    op["id"] = operadores[i].id;
+    op["nome"] = operadores[i].nome;
+    op["status"] = operadores[i].status;
+    op["bloqueado"] = operadores[i].bloqueado;
+  }
+  String resposta;
+  serializeJson(doc, resposta);
+  server.send(200, "application/json", resposta);
+}
+
+void handleDesbloquear() {
+  if (server.hasArg("id")) {
+    String id = server.arg("id");
+    id.toUpperCase();
+    desbloquearCracha(id);
+    server.send(200, "text/plain", "Cracha desbloqueado: " + id);
+  } else {
+    server.send(400, "text/plain", "ID nao fornecido");
+  }
+}
+
+void handleSimularRFID() {
+  if (server.hasArg("id")) {
+    String id = server.arg("id");
+    id.toUpperCase();
+    
+    Serial.print("RFID SIMULADO VIA WEB: ");
+    Serial.println(id);
+    
+    bool valido = false;
+    String nomeEncontrado = "";
+    for (int i = 0; i < numOperadores; i++) {
+      if (operadores[i].id == id) {
+        nomeEncontrado = operadores[i].nome;
+        valido = true;
+        break;
+      }
+    }
+    
+    if (valido) {
+      iniciarLeituraSimulada(id, nomeEncontrado);
+      server.send(200, "text/plain", "OK: " + id + " - " + nomeEncontrado);
+    } else {
+      server.send(400, "text/plain", "ERRO: ID nao encontrado - " + id);
+    }
+  } else {
+    server.send(400, "text/plain", "ERRO: Parametro 'id' nao fornecido");
+  }
+}
+
+void handleEmergency() {
+  String action = server.arg("action");
+  if (action == "trigger") {
+    estadoAtual = EMERGENCIA_COMPROMETIDA;
+    server.send(200, "text/plain", "EMERGENCIA");
+  } else if (action == "reset") {
+    estadoAtual = STANDBY_ENERGIZADO;
+    idOperadorAtual = "";
+    nomeOperadorAtual = "";
+    temperaturaAtual = 0;
+    batimentosAtual = 0;
+    for (int i = 0; i < 10; i++) historicoBPM[i] = 0;
+    indiceGrafico = 0;
+    leituraTempValida = false;
+    leituraBPMValida = false;
+    acessoLiberado = false;
+    tentativasInstaveis = 0;
+    aguardandoModoEstavel = false;
+    MODO_TEMP_INSTAVEL = false;
+    server.send(200, "text/plain", "RESETADO");
+  }
+}
+
+void inicializarServidorWeb() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/operadores", handleOperadores);
+  server.on("/desbloquear", handleDesbloquear);
+  server.on("/simular_rfid", handleSimularRFID);
+  server.on("/emergencia", handleEmergency);
+  server.begin();
+  Serial.println("Servidor Web iniciado!");
+}
+
+// =================================================================================
+// SETUP
+// =================================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  randomSeed(analogRead(0));
+  
+  Serial.println("\n========================================");
+  Serial.println("   SISO SYSTEM - TCC");
+  Serial.println("   SISTEMA INTEGRADO DE SEGURANCA");
+  Serial.println("========================================");
+  
+  Wire.begin(I2C0_SDA, I2C0_SCL);
+  Wire.setClock(100000);
+  Serial.println("I2C-0: MLX90614 (SDA=21, SCL=22)");
+  
+  Wire1.begin(I2C1_SDA, I2C1_SCL);
+  Wire1.setClock(100000);
+  Serial.println("I2C-1: MAX30102 (SDA=33, SCL=25)");
+  
+  pinMode(RELE_VERMELHO, OUTPUT);
+  pinMode(RELE_AMARELO, OUTPUT);
+  pinMode(RELE_VERDE, OUTPUT);
+  pinMode(RELE_RESERVA, OUTPUT);
+  digitalWrite(RELE_VERMELHO, LOW);
+  digitalWrite(RELE_AMARELO, LOW);
+  digitalWrite(RELE_VERDE, LOW);
+  digitalWrite(RELE_RESERVA, LOW);
+  Serial.println("Reles configurados (ATIVO EM HIGH)");
+  
+  pinMode(PINO_EMERGENCIA, INPUT_PULLUP);
+  Serial.println("Botao de emergencia NF configurado");
+  
+  Serial.println("\nInicializando RFID...");
+  pinMode(RFID_RST_PIN, OUTPUT);
+  digitalWrite(RFID_RST_PIN, LOW);
+  delay(50);
+  digitalWrite(RFID_RST_PIN, HIGH);
+  delay(100);
+  
+  SPI.begin();
+  delay(50);
+  
+  rfid.PCD_Init();
+  delay(100);
+  
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);
+  
+  byte versao = rfid.PCD_ReadRegister(rfid.VersionReg);
+  Serial.print("   Versao do chip: 0x");
+  Serial.println(versao, HEX);
+  
+  if (versao == 0x00 || versao == 0xFF) {
+    Serial.println("   MFRC522 nao detectado - use simulacao (comandos 1, 2, 3)");
+  } else {
+    Serial.println("   MFRC522 detectado!");
+  }
+  
+  Serial.println("\nInicializando MLX90614...");
+  if (mlx.begin()) {
+    Serial.println("   MLX90614 inicializado");
+  } else {
+    Serial.println("   Erro MLX90614!");
+  }
+  
+  Serial.println("\nInicializando MAX30102...");
+  if (particleSensor.begin(Wire1, I2C_SPEED_STANDARD)) {
+    particleSensor.setup(0x1F, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeGreen(0);
+    Serial.println("   MAX30102 configurado");
+  } else {
+    Serial.println("   Erro MAX30102!");
+  }
+  
+  Serial.println("\nConectando WiFi...");
+  WiFi.begin(ssid, password);
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 60) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n   WiFi Conectado!");
+    Serial.print("   IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n   Falha ao conectar WiFi!");
+    Serial.print("   Status: ");
+    Serial.println(WiFi.status());
+  }
+  
+  inicializarServidorWeb();
+  atualizarPainelHMI(true, false, false);
+  
+  Serial.println("\n========================================");
+  Serial.println("   SISTEMA PRONTO PARA USO");
+  Serial.println("========================================");
+  Serial.println("SIMULACAO RFID (Serial Monitor):");
+  Serial.println("   1 - Heitor (D23D0801)");
+  Serial.println("   2 - Natan  (838CF337)");
+  Serial.println("   3 - Luiz    (90X12Y34)");
+  Serial.println("");
+  Serial.println("MODOS DE OPERACAO:");
+  Serial.println("   t - Ativar/Desativar MODO ESTAVEL");
+  Serial.println("   i - Ativar/Desativar TEMP INSTAVEL");
+  Serial.println("");
+  Serial.println("CONTROLE:");
+  Serial.println("   r - Iniciar | e - Emergencia");
+  Serial.println("   s - Standby | d - Dados | h - Ajuda");
+  Serial.println("========================================\n");
+}
+
+// =================================================================================
+// LOOP PRINCIPAL
+// =================================================================================
+void loop() {
+  server.handleClient();
+  processarComandosSerial();
+  
+  if (digitalRead(PINO_EMERGENCIA) == HIGH && estadoAtual != EMERGENCIA_COMPROMETIDA) {
+    estadoAtual = EMERGENCIA_COMPROMETIDA;
+    Serial.println("EMERGENCIA ACIONADA PELO BOTAO!");
+    atualizarPainelHMI(true, false, false);
+  }
+  
+  String idDetectado = obterIDRFID();
+  
+  switch (estadoAtual) {
+    
+    case EMERGENCIA_COMPROMETIDA:
+      atualizarPainelHMI(true, false, false);
+      if (digitalRead(PINO_EMERGENCIA) == LOW) {
+        estadoAtual = STANDBY_ENERGIZADO;
+        acessoLiberado = false;
+        tentativasInstaveis = 0;
+        Serial.println("Emergencia resetada");
+        atualizarPainelHMI(true, false, false);
+      }
+      break;
+    
+    case STANDBY_ENERGIZADO:
+      atualizarPainelHMI(true, false, false);
+      if (idDetectado != "" && buscarEValidarOperador(idDetectado)) {
+        idOperadorAtual = idDetectado;
+        tempoTransicao = millis();
+        indiceGrafico = 0;
+        temperaturaAtual = 0;
+        batimentosAtual = 0;
+        leituraTempValida = false;
+        leituraBPMValida = false;
+        acessoLiberado = false;
+        tentativasInstaveis = 0;
+        contadorTemp = 0;
+        contadorBPM = 0;
+        estadoAtual = LEITURA_EM_ANDAMENTO;
+        
+        if (MODO_ESTAVEL) {
+          tempoInicioLeituraEstavel = millis();
+          aguardandoModoEstavel = true;
+          ultimaVariacaoEstavel = 0;
+        }
+        
+        Serial.println("\nIniciando leitura...");
+        if (MODO_TEMP_INSTAVEL) {
+          Serial.println("   MODO TEMP INSTAVEL ativo - cracha sera bloqueado!");
+        } else {
+          Serial.println("   Coloque o dedo no MAX30102");
+          Serial.println("   Aponte o MLX90614 para a testa");
+        }
+      }
+      break;
+    
+    case LEITURA_EM_ANDAMENTO: {
+      atualizarPainelHMI(false, true, false);
+      
+      float temp = lerTemperatura();
+      if (temp > 30 && temp < 50) temperaturaAtual = temp;
+      
+      int bpm = lerBatimentos();
+      if (bpm > 0) batimentosAtual = bpm;
+      
+      // ============================================================
+      // MODO TEMPERATURA INSTAVEL - BLOQUEIO RAPIDO GARANTIDO
+      // ============================================================
+      if (MODO_TEMP_INSTAVEL) {
+        tentativasInstaveis++;
+        
+        // Mostra progresso
+        if (tentativasInstaveis % 5 == 0) {
+          Serial.print("TEMP INSTAVEL - Tentativa ");
+          Serial.print(tentativasInstaveis);
+          Serial.print(" de ");
+          Serial.println(MAX_TENTATIVAS_INSTAVEIS);
+        }
+        
+        // Bloqueia apos atingir o maximo
+        if (tentativasInstaveis >= MAX_TENTATIVAS_INSTAVEIS) {
+          Serial.println("\n========================================");
+          Serial.println("   BLOQUEANDO CRACHA POR TEMP INSTAVEL");
+          Serial.println("========================================");
+          
+          bloquearCracha(idOperadorAtual, nomeOperadorAtual);
+          totalBloqueiosSaude++;
+          
+          Serial.println("CRACHA BLOQUEADO: " + idOperadorAtual);
+          Serial.println("Bloqueios por saude totais: " + String(totalBloqueiosSaude));
+          
+          // Limpa estado
+          idOperadorAtual = "";
+          nomeOperadorAtual = "";
+          temperaturaAtual = 0;
+          batimentosAtual = 0;
+          leituraTempValida = false;
+          leituraBPMValida = false;
+          tentativasInstaveis = 0;
+          MODO_TEMP_INSTAVEL = false;
+          estadoAtual = STANDBY_ENERGIZADO;
+          atualizarPainelHMI(true, false, false);
+          
+          break;
+        }
+        
+        break;
+      }
+      
+      // ============================================================
+      // MODO ESTAVEL - Aguarda 10 segundos
+      // ============================================================
+      if (MODO_ESTAVEL && aguardandoModoEstavel) {
+        unsigned long tempoDecorrido = millis() - tempoInicioLeituraEstavel;
+        
+        static unsigned long ultimoPrintEstavel = 0;
+        if (millis() - ultimoPrintEstavel > 1000) {
+          ultimoPrintEstavel = millis();
+          int segundosRestantes = (DELAY_MODO_ESTAVEL - tempoDecorrido) / 1000;
+          if (segundosRestantes > 0) {
+            Serial.print("Processando leitura... ");
+            Serial.print(segundosRestantes);
+            Serial.print("s restantes | Temp: ");
+            Serial.print(temperaturaAtual, 1);
+            Serial.print("C | BPM: ");
+            Serial.print(batimentosAtual);
+            Serial.println(" BPM");
+          }
+        }
+        
+        if (tempoDecorrido >= DELAY_MODO_ESTAVEL) {
+          aguardandoModoEstavel = false;
+          
+          if (podeLiberarAcesso()) {
+            acessoLiberado = true;
+            totalAcessosLiberados++;
+            estadoAtual = LEITURA_APROVADA;
+            Serial.println("\nACESSO LIBERADO!");
+            Serial.print("   Temp: "); Serial.print(temperaturaAtual, 1); Serial.println("C");
+            Serial.print("   BPM: "); Serial.print(batimentosAtual); Serial.println(" BPM");
+            atualizarPainelHMI(false, false, true);
+            tentativasInstaveis = 0;
+          } else {
+            totalBloqueiosSaude++;
+            Serial.println("\nACESSO BLOQUEADO!");
+            idOperadorAtual = "";
+            nomeOperadorAtual = "";
+            temperaturaAtual = 0;
+            batimentosAtual = 0;
+            leituraTempValida = false;
+            leituraBPMValida = false;
+            tentativasInstaveis = 0;
+            estadoAtual = STANDBY_ENERGIZADO;
+            atualizarPainelHMI(true, false, false);
+          }
+        }
+        break;
+      }
+      
+      // ============================================================
+      // MODO NORMAL
+      // ============================================================
+      if (leituraTempValida && leituraBPMValida && !acessoLiberado) {
+        if (podeLiberarAcesso()) {
+          acessoLiberado = true;
+          totalAcessosLiberados++;
+          estadoAtual = LEITURA_APROVADA;
+          Serial.println("\nACESSO LIBERADO!");
+          Serial.print("   Temp: "); Serial.print(temperaturaAtual); Serial.println("C");
+          Serial.print("   BPM: "); Serial.print(batimentosAtual); Serial.println(" BPM");
+          atualizarPainelHMI(false, false, true);
+          tentativasInstaveis = 0;
+        }
+      }
+      
+      unsigned long tempoDecorrido = millis() - tempoTransicao;
+      
+      if (tempoDecorrido > 20000 && idOperadorAtual != "") {
+        bool realmenteInstavel = false;
+        
+        if (!leituraTempValida && contadorTemp >= 3) realmenteInstavel = true;
+        if (!leituraBPMValida && contadorBPM >= 3) realmenteInstavel = true;
+        
+        if (leituraTempValida && leituraBPMValida) {
+          tentativasInstaveis = 0;
+          realmenteInstavel = false;
+        }
+        
+        if (realmenteInstavel) {
+          tentativasInstaveis++;
+          
+          if (tentativasInstaveis % 3 == 0) {
+            Serial.print("Medicoes INSTAVEIS - Tentativa ");
+            Serial.print(tentativasInstaveis);
+            Serial.print(" de ");
+            Serial.println(MAX_TENTATIVAS_INSTAVEIS);
+          }
+          
+          if (tentativasInstaveis >= MAX_TENTATIVAS_INSTAVEIS) {
+            bloquearCracha(idOperadorAtual, nomeOperadorAtual);
+            Serial.println("CRACHA BLOQUEADO POR INSTABILIDADE!");
+            
+            idOperadorAtual = "";
+            nomeOperadorAtual = "";
+            temperaturaAtual = 0;
+            batimentosAtual = 0;
+            leituraTempValida = false;
+            leituraBPMValida = false;
+            tentativasInstaveis = 0;
+            estadoAtual = STANDBY_ENERGIZADO;
+            atualizarPainelHMI(true, false, false);
+          }
+        } else {
+          if (tentativasInstaveis > 0) tentativasInstaveis = 0;
+        }
+      }
+      
+      if (millis() - tempoTransicao > TIMEOUT_LEITURA && !acessoLiberado) {
+        Serial.println("\nTIMEOUT!");
+        
+        if (tentativasInstaveis > 5 && idOperadorAtual != "") {
+          bloquearCracha(idOperadorAtual, nomeOperadorAtual);
+          Serial.println("CRACHA BLOQUEADO POR TIMEOUT COM INSTABILIDADE!");
+        } else {
+          Serial.println("   Tempo esgotado - nenhum bloqueio aplicado");
+        }
+        
+        idOperadorAtual = "";
+        nomeOperadorAtual = "";
+        temperaturaAtual = 0;
+        batimentosAtual = 0;
+        leituraTempValida = false;
+        leituraBPMValida = false;
+        tentativasInstaveis = 0;
+        estadoAtual = STANDBY_ENERGIZADO;
+        atualizarPainelHMI(true, false, false);
+      }
+      break;
+    }
+    
+    case LEITURA_APROVADA:
+      atualizarPainelHMI(false, false, true);
+      if (idDetectado != "" && idDetectado == idOperadorAtual) {
+        idOperadorAtual = "";
+        nomeOperadorAtual = "";
+        temperaturaAtual = 0;
+        batimentosAtual = 0;
+        leituraTempValida = false;
+        leituraBPMValida = false;
+        acessoLiberado = false;
+        tentativasInstaveis = 0;
+        estadoAtual = STANDBY_ENERGIZADO;
+        Serial.println("Operador finalizou acesso");
+        atualizarPainelHMI(true, false, false);
+      }
+      break;
+  }
+  
+  delay(50);
+}
